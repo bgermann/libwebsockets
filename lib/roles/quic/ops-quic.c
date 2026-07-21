@@ -89,8 +89,8 @@ lws_quic_pto_cb(lws_sorted_usec_list_t *sul)
 			}
 		}
 
-		if (total_bytes_lost && qn->cc_ops && qn->cc_ops->on_loss)
-			qn->cc_ops->on_loss(qn->nwsi, total_bytes_lost);
+		if (total_bytes_lost && qn->cc_ops && qn->cc_ops->on_discard)
+			qn->cc_ops->on_discard(qn->nwsi, total_bytes_lost);
 
 		/* For App Data, just send a PING to elicit an ACK */
 		if (!sent_ping && qn->in_flight[LWS_QUIC_LEVEL_APP].count) {
@@ -167,6 +167,7 @@ lws_quic_detect_loss(struct lws *nwsi, int level, uint64_t largest_acked)
         size_t total_bytes_lost = 0;
         lws_usec_t now = lws_now_usecs();
         lws_usec_t loss_time = qn->smoothed_rtt ? (qn->smoothed_rtt * 9 / 8) : 50000;
+        lws_usec_t oldest_lost = 0, newest_lost = 0;
 
 	int check_levels[] = { level, level == LWS_QUIC_LEVEL_APP ? LWS_QUIC_LEVEL_EARLY : -1 };
 	for (int i = 0; i < 2; i++) {
@@ -183,6 +184,11 @@ lws_quic_detect_loss(struct lws *nwsi, int level, uint64_t largest_acked)
 				total_bytes_lost += f->wire_len;
 				lwsl_wsi_info(nwsi, "QUIC LOSS: Packet %llu lost, frame %d", (unsigned long long)f->sent_in_pn, f->type);
 				
+				if (!oldest_lost || f->sent_time_us < oldest_lost)
+					oldest_lost = f->sent_time_us;
+				if (!newest_lost || f->sent_time_us > newest_lost)
+					newest_lost = f->sent_time_us;
+
 				lws_dll2_remove(&f->list);
 				f->wire_len = 0;
 				
@@ -195,15 +201,25 @@ lws_quic_detect_loss(struct lws *nwsi, int level, uint64_t largest_acked)
 		} lws_end_foreach_dll_safe(d, d1);
 	}
 
-        if (total_bytes_lost && qn->cc_ops && qn->cc_ops->on_loss)
+        if (total_bytes_lost && qn->cc_ops && qn->cc_ops->on_loss) {
                 qn->cc_ops->on_loss(nwsi, total_bytes_lost);
+
+                if (newest_lost > oldest_lost) {
+                        lws_usec_t pto = qn->smoothed_rtt + (qn->rttvar * 4 > 1000 ? qn->rttvar * 4 : 1000) + 25000;
+                        lws_usec_t pc_period = pto * 3;
+                        if ((newest_lost - oldest_lost) >= pc_period) {
+                                if (qn->cc_ops->on_persistent_congestion)
+                                        qn->cc_ops->on_persistent_congestion(nwsi);
+                        }
+                }
+        }
 
         if (total_bytes_lost)
                 lws_callback_on_writable(nwsi);
 }
 
 void
-lws_quic_handle_ack(struct lws *nwsi, int level, uint64_t acked_pn)
+lws_quic_handle_ack(struct lws *nwsi, int level, uint64_t acked_pn, int is_largest_ack, uint64_t ack_delay)
 {
 	struct lws_quic_netconn *qn = nwsi->quic.qn;
 	if (!qn) return;
@@ -257,15 +273,21 @@ lws_quic_handle_ack(struct lws *nwsi, int level, uint64_t acked_pn)
 		qn->pto_count = 0;
 
 		/* Update RTT Estimator (RFC 9002 5.3) */
-		if (rtt > 0) {
+		if (is_largest_ack && rtt > 0) {
+			lws_usec_t adjusted_rtt = rtt;
+			if (qn->min_rtt && rtt > qn->min_rtt + (lws_usec_t)ack_delay) {
+				adjusted_rtt = rtt - (lws_usec_t)ack_delay;
+			}
 			qn->latest_rtt = rtt;
 			if (!qn->smoothed_rtt) {
 				qn->smoothed_rtt = rtt;
 				qn->rttvar = rtt / 2;
+				qn->min_rtt = rtt;
 			} else {
-				lws_usec_t rtt_diff = qn->smoothed_rtt > rtt ? (qn->smoothed_rtt - rtt) : (rtt - qn->smoothed_rtt);
+				if (rtt < qn->min_rtt) qn->min_rtt = rtt;
+				lws_usec_t rtt_diff = qn->smoothed_rtt > adjusted_rtt ? (qn->smoothed_rtt - adjusted_rtt) : (adjusted_rtt - qn->smoothed_rtt);
 				qn->rttvar = (3 * qn->rttvar + rtt_diff) / 4;
-				qn->smoothed_rtt = (7 * qn->smoothed_rtt + rtt) / 8;
+				qn->smoothed_rtt = (7 * qn->smoothed_rtt + adjusted_rtt) / 8;
 			}
 		}
 
@@ -682,6 +704,7 @@ rops_handle_POLLIN_quic(struct lws_context_per_thread *pt, struct lws *wsi,
 		nwsi->quic.qn->original_version = pkt_version;
 		nwsi->quic.qn->max_streams_bidi_local = 400;
 		nwsi->quic.qn->max_streams_unidi_local = 400;
+		nwsi->quic.qn->peer_ack_delay_exponent = 3;
 
 		nwsi->quic.qn->current_mtu = 1280;
 		nwsi->quic.qn->probed_mtu = 1380; /* first probe size */
@@ -1018,7 +1041,7 @@ tp_ok:
 					int client_scid_pos = 6 + dcid_len;
 					size_t tok_pos = (size_t)client_scid_pos + 1 + scid.len;
 					if (n >= 16 && tag_pos >= tok_pos) {
-						if (!lws_quic_validate_retry_tag(nwsi->quic.qn, p, tag_pos, &p[tag_pos])) {
+						if (!lws_quic_validate_retry_tag(nwsi->quic.qn, nwsi->quic.qn->rem_cid.id, nwsi->quic.qn->rem_cid.len, p, tag_pos, &p[tag_pos])) {
 							nwsi->quic.qn->retry_scid = scid;
 							nwsi->quic.qn->rem_cid = scid;
 							nwsi->quic.qn->retry_token_len = tag_pos - tok_pos;
@@ -1083,6 +1106,17 @@ tp_ok:
 			break;
 		}
 
+		/* F-57: Validate short header DCID */
+		if (!(p[0] & 0x80) && nwsi && nwsi->quic.qn && nwsi->quic.qn->loc_cid.len) {
+			if (local_dcid_len > (size_t)n - 1 || memcmp(&p[1], nwsi->quic.qn->loc_cid.id, local_dcid_len)) {
+				lwsl_wsi_notice(wsi, "QUIC RX: Short header DCID mismatch");
+				/* Drop packet */
+				p += packet_size;
+				n -= (int)packet_size;
+				continue;
+			}
+		}
+
 		struct lws_quic_keys *k = nwsi->quic.qn->keys[level];
 
 		if (!k || !k->el_hp_rx.len) {
@@ -1144,6 +1178,8 @@ tp_ok:
 			if (nwsi->quic.qn && nwsi->quic.qn->rx_key_phase != kp) {
 				/* Provisional key update */
 				scratch_keys = *k;
+				scratch_keys.aead_rx = NULL;
+				scratch_keys.aead_tx = NULL;
 				if (lws_quic_update_keys(&scratch_keys, 1) == 0) {
 					decryption_keys = &scratch_keys;
 					is_key_update = 1;
@@ -1156,11 +1192,17 @@ tp_ok:
 		int dec_len = lws_quic_decrypt_payload(decryption_keys, p, packet_size, pn_offset, (uint8_t)pn_len, full_pn);
 		if (dec_len < 0) {
 			lwsl_wsi_notice(wsi, "QUIC RX: AEAD Decryption failed (bad tag or truncated)");
+			if (is_key_update) {
+				lws_quic_keys_release_aead_rx(&scratch_keys);
+				lws_quic_keys_release_aead_tx(&scratch_keys);
+			}
 			break;
 		}
 
 		/* Decryption succeeded! Commit key update if pending */
 		if (is_key_update) {
+			lws_quic_keys_release_aead_rx(k);
+			lws_quic_keys_release_aead_tx(k);
 			*k = scratch_keys;
 			nwsi->quic.qn->rx_key_phase ^= 1;
 			nwsi->quic.qn->rx_packets_since_update = 0;
@@ -1244,10 +1286,14 @@ tp_ok:
 
 				if (nwsi->quic.qn->is_server) {
 #if (_LWS_ENABLED_LOGS & LLL_NOTICE)
-					lwsl_notice("QUIC Server: Connection Migration verified! Peer address changed from %s:%u to %s:%u\n",
+					lwsl_notice("QUIC Server: Connection Migration initiated! Peer address changed from %s:%u to %s:%u (pending validation)\n",
 						    buf_old, (unsigned int)ntohs(port_old),
 						    buf_new, (unsigned int)ntohs(port_new));
 #endif
+					/* F-60: Do NOT commit nwsi->udp->sa46 yet! Wait for PATH_RESPONSE! */
+					nwsi->quic.qn->probing_sa46 = migration_sa46;
+					nwsi->quic.qn->probing_sa46_valid = 1;
+
 				} else {
 #if (_LWS_ENABLED_LOGS & LLL_NOTICE)
 					lwsl_notice("QUIC Client: Server address changed from %s:%u to %s:%u, re-connecting socket\n",
@@ -1259,30 +1305,30 @@ tp_ok:
 					if (connect(nwsi->desc.sockfd, sa46_sockaddr(&migration_sa46), sa46_socklen(&migration_sa46)) < 0) {
 						lwsl_warn("QUIC: failed to re-connect client socket, errno=%d\n", errno);
 					}
+
+					nwsi->udp->sa46 = migration_sa46;
+
+					/* Reset Congestion Control State (RFC 9000 9.3.3) */
+					if (nwsi->quic.qn->cc_ops && nwsi->quic.qn->cc_ops->init)
+						nwsi->quic.qn->cc_ops->init(nwsi);
+
+					/* Reset RTT estimator */
+					nwsi->quic.qn->smoothed_rtt = 0;
+					nwsi->quic.qn->rttvar = 0;
+					nwsi->quic.qn->latest_rtt = 0;
+
+					/* Reset PMTUD */
+					nwsi->quic.qn->current_mtu = 1280;
+					nwsi->quic.qn->probed_mtu = 1380;
+					nwsi->quic.qn->pmtud_state = 1;
+
+					/* Set path to unvalidated */
+					nwsi->quic.qn->address_validated = 0;
+
+					/* Reset Path Bytes for Anti-Amplification tracking */
+					nwsi->quic.qn->bytes_received = (uint64_t)orig_n;
+					nwsi->quic.qn->bytes_sent = 0;
 				}
-
-				nwsi->udp->sa46 = migration_sa46;
-
-				/* Reset Congestion Control State (RFC 9000 9.3.3) */
-				if (nwsi->quic.qn->cc_ops && nwsi->quic.qn->cc_ops->init)
-					nwsi->quic.qn->cc_ops->init(nwsi);
-
-				/* Reset RTT estimator */
-				nwsi->quic.qn->smoothed_rtt = 0;
-				nwsi->quic.qn->rttvar = 0;
-				nwsi->quic.qn->latest_rtt = 0;
-
-				/* Reset PMTUD */
-				nwsi->quic.qn->current_mtu = 1280;
-				nwsi->quic.qn->probed_mtu = 1380;
-				nwsi->quic.qn->pmtud_state = 1;
-
-				/* Set path to unvalidated */
-				nwsi->quic.qn->address_validated = 0;
-
-				/* Reset Path Bytes for Anti-Amplification tracking */
-				nwsi->quic.qn->bytes_received = (uint64_t)orig_n;
-				nwsi->quic.qn->bytes_sent = 0;
 
 				/* Initiate Path Validation (Generate PATH_CHALLENGE) if none pending */
 				if (!nwsi->quic.qn->path_challenge_pending) {
@@ -1294,6 +1340,11 @@ tp_ok:
 						lws_get_random(wsi->a.context, f_pc->data, 8);
 						memcpy(nwsi->quic.qn->path_challenge, f_pc->data, 8);
 						nwsi->quic.qn->path_challenge_pending = 1;
+
+						if (nwsi->quic.qn->is_server) {
+							f_pc->has_dest = 1;
+							f_pc->dest_sa46 = migration_sa46;
+						}
 
 						lws_dll2_add_head(&f_pc->list, &nwsi->quic.qn->pending_tx[LWS_QUIC_LEVEL_APP]);
 						lws_callback_on_writable(nwsi);
@@ -2647,9 +2698,10 @@ rops_client_bind_quic(struct lws *wsi, const struct lws_client_connect_info *i)
 		wsi->quic.qn->next_stream_id_bidi_local = 0;
 		wsi->quic.qn->next_stream_id_unidi_local = 2;
 		wsi->quic.qn->version = LWS_QUIC_VERSION_1;
-		wsi->quic.qn->original_version = wsi->quic.qn->version;
+		wsi->quic.qn->original_version = LWS_QUIC_VERSION_1;
 		wsi->quic.qn->max_streams_bidi_local = 1000;
-		wsi->quic.qn->max_streams_unidi_local = 1024;
+		wsi->quic.qn->max_streams_unidi_local = 1000;
+		wsi->quic.qn->peer_ack_delay_exponent = 3;
 
 		wsi->quic.qn->current_mtu = 1280;
 		wsi->quic.qn->probed_mtu = 1380; /* first probe size */

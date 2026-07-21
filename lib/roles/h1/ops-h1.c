@@ -148,10 +148,15 @@ http_postbody:
 			 * what we have in the read buffer (len)
 			 * remaining portion of the POST body (content_remain)
 			 */
-			if (wsi->http.content_length_given)
+			if (wsi->http.content_length_given) {
 				body_chunk_len = min(wsi->http.rx_content_remain, len);
-			else
+			} else {
+				if (lwsi_role_server(wsi) && (lws_filepos_t)len > wsi->http.rx_content_remain) {
+					lwsl_warn("%s: body exceeded max size\n", __func__);
+					goto bail;
+				}
 				body_chunk_len = len;
+			}
 			wsi->http.rx_content_remain -= body_chunk_len;
 			// len -= body_chunk_len;
 #ifdef LWS_WITH_CGI

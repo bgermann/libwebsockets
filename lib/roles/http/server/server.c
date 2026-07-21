@@ -1141,8 +1141,9 @@ lws_find_mount(struct lws *wsi, const char *uri_ptr, int uri_len)
 static int
 lws_find_string_in_file(const char *filename, const char *string, int stringlen)
 {
-	char buf[128];
-	int fd, match = 0, pos = 0, n = 0, hit = 0;
+	char buf[256];
+	int fd, n = 0, hit = 0;
+	size_t pos = 0;
 
 	fd = lws_open(filename, O_RDONLY);
 	if (fd < 0) {
@@ -1151,30 +1152,47 @@ lws_find_string_in_file(const char *filename, const char *string, int stringlen)
 	}
 
 	while (1) {
-		if (pos == n) {
-			n = (int)read(fd, buf, sizeof(buf));
-			if (n <= 0) {
-				if (match == stringlen)
+		n = (int)read(fd, buf + pos, sizeof(buf) - 1 - pos);
+		if (n <= 0)
+			break;
+		
+		pos += (size_t)n;
+		buf[pos] = '\0';
+		
+		char *line = buf;
+		char *nl = strchr(line, '\n');
+		while (nl) {
+			*nl = '\0';
+			if (nl > line && *(nl - 1) == '\r')
+				*(nl - 1) = '\0';
+			
+			size_t line_len = strlen(line);
+			if (line_len == (size_t)stringlen) {
+				if (!lws_timingsafe_bcmp(line, string, (uint32_t)stringlen)) {
 					hit = 1;
-				break;
+					break;
+				}
 			}
+			
+			line = nl + 1;
+			nl = strchr(line, '\n');
+		}
+		
+		if (hit) break;
+		
+		size_t rem = pos - (size_t)(line - buf);
+		if (rem > 0)
+			memmove(buf, line, rem);
+		pos = rem;
+		if (pos == sizeof(buf) - 1) {
+			/* Line too long, truncate it */
 			pos = 0;
 		}
-
-		if (match == stringlen) {
-			if (buf[pos] == '\r' || buf[pos] == '\n') {
-				hit = 1;
-				break;
-			}
-			match = 0;
-		}
-
-		if (buf[pos] == string[match])
-			match++;
-		else
-			match = 0;
-
-		pos++;
+	}
+	
+	if (!hit && pos > 0) {
+		if (pos == (size_t)stringlen && !lws_timingsafe_bcmp(buf, string, (uint32_t)stringlen))
+			hit = 1;
 	}
 
 	close(fd);
@@ -1891,53 +1909,67 @@ lws_http_action(struct lws *wsi)
 
 	/* HTTP header had a content length? */
 
-	wsi->http.rx_content_length = 0;
-	wsi->http.content_length_explicitly_zero = 0;
-	if (lws_hdr_total_length(wsi, WSI_TOKEN_POST_URI)
-#if defined(LWS_WITH_HTTP_UNCOMMON_HEADERS)
-			||
-	    lws_hdr_total_length(wsi, WSI_TOKEN_PATCH_URI) ||
-	    lws_hdr_total_length(wsi, WSI_TOKEN_PUT_URI)
-#endif
-	    )
-		wsi->http.rx_content_length = 100 * 1024 * 1024;
+	{
+		uint64_t max_body = wsi->a.vhost->max_http_body_size ? wsi->a.vhost->max_http_body_size : 100 * 1024 * 1024;
 
-	if (lws_hdr_total_length(wsi, WSI_TOKEN_HTTP_CONTENT_LENGTH) &&
-	    lws_hdr_copy(wsi, content_length_str,
-			 sizeof(content_length_str) - 1,
-			 WSI_TOKEN_HTTP_CONTENT_LENGTH) > 0) {
-		long long cl_val = atoll(content_length_str);
-		if (cl_val < 0) {
-			lwsl_warn("%s: rejected negative Content-Length: %s\n",
-				  __func__, content_length_str);
-			lws_return_http_status(wsi, HTTP_STATUS_BAD_REQUEST, NULL);
-			return 1;
-		}
-		wsi->http.rx_content_remain = wsi->http.rx_content_length =
-				(lws_filepos_t)cl_val;
-		if (!wsi->http.rx_content_length) {
-			wsi->http.content_length_explicitly_zero = 1;
-			lwsl_debug("%s: explicit 0 content-length\n", __func__);
-		}
-	}
-#if defined(LWS_ROLE_H2)
-	else if (lwsi_role_h2(wsi) && wsi->mux_substream && wsi->h2.END_STREAM) {
-		/*
-		 * h2 with no Content-Length, but END_STREAM already arrived on
-		 * the HEADERS: the request body is empty and complete.  Without
-		 * this, a body-bearing method (POST/PUT/PATCH) would be left
-		 * waiting on the 100MB default above for a body that will never
-		 * come, stalling the request until it times out.  Treat it as an
-		 * explicit zero-length body, exactly as an explicit
-		 * "Content-Length: 0" would (h3 does the equivalent in ops-h3.c).
-		 */
-		wsi->http.rx_content_remain = wsi->http.rx_content_length = 0;
-		wsi->http.content_length_given = 1;
-		wsi->http.content_length_explicitly_zero = 1;
-		lwsl_debug("%s: h2 END_STREAM, no content-length: empty body\n",
-			   __func__);
-	}
+		wsi->http.rx_content_length = 0;
+		wsi->http.content_length_explicitly_zero = 0;
+		if (lws_hdr_total_length(wsi, WSI_TOKEN_POST_URI)
+#if defined(LWS_WITH_HTTP_UNCOMMON_HEADERS)
+				||
+		    lws_hdr_total_length(wsi, WSI_TOKEN_PATCH_URI) ||
+		    lws_hdr_total_length(wsi, WSI_TOKEN_PUT_URI)
 #endif
+		    ) {
+			wsi->http.rx_content_length = max_body;
+			if (!wsi->http.rx_content_remain)
+				wsi->http.rx_content_remain = max_body;
+		}
+
+		if (lws_hdr_total_length(wsi, WSI_TOKEN_HTTP_CONTENT_LENGTH) &&
+		    lws_hdr_copy(wsi, content_length_str,
+				 sizeof(content_length_str) - 1,
+				 WSI_TOKEN_HTTP_CONTENT_LENGTH) > 0) {
+			long long cl_val = atoll(content_length_str);
+			if (cl_val < 0) {
+				lwsl_warn("%s: rejected negative Content-Length: %s\n",
+					  __func__, content_length_str);
+				lws_return_http_status(wsi, HTTP_STATUS_BAD_REQUEST, NULL);
+				return 1;
+			}
+			if ((uint64_t)cl_val > max_body) {
+				lwsl_warn("%s: rejected Content-Length %lld > max %llu\n",
+					  __func__, cl_val, (unsigned long long)max_body);
+				lws_return_http_status(wsi, HTTP_STATUS_REQ_ENTITY_TOO_LARGE, NULL);
+				return 1;
+			}
+			wsi->http.rx_content_remain = wsi->http.rx_content_length =
+					(lws_filepos_t)cl_val;
+			wsi->http.content_length_given = 1;
+			if (!wsi->http.rx_content_length) {
+				wsi->http.content_length_explicitly_zero = 1;
+				lwsl_debug("%s: explicit 0 content-length\n", __func__);
+			}
+		}
+#if defined(LWS_ROLE_H2)
+		else if (lwsi_role_h2(wsi) && wsi->mux_substream && wsi->h2.END_STREAM) {
+			/*
+			 * h2 with no Content-Length, but END_STREAM already arrived on
+			 * the HEADERS: the request body is empty and complete.  Without
+			 * this, a body-bearing method (POST/PUT/PATCH) would be left
+			 * waiting on the 100MB default above for a body that will never
+			 * come, stalling the request until it times out.  Treat it as an
+			 * explicit zero-length body, exactly as an explicit
+			 * "Content-Length: 0" would (h3 does the equivalent in ops-h3.c).
+			 */
+			wsi->http.rx_content_remain = wsi->http.rx_content_length = 0;
+			wsi->http.content_length_given = 1;
+			wsi->http.content_length_explicitly_zero = 1;
+			lwsl_debug("%s: h2 END_STREAM, no content-length: empty body\n",
+				   __func__);
+		}
+#endif
+	}
 
 	if (wsi->mux_substream) {
 		wsi->http.request_version = HTTP_VERSION_2;
@@ -2082,6 +2114,22 @@ lws_http_action(struct lws *wsi)
 	wsi->mount_hit = 1;
 	wsi->http.mount_specific_headers = hit->headers;
 	wsi->http.mount_specific_keepalive_timeout_secs = hit->keepalive_timeout;
+
+	if (hit->max_http_body_size) {
+		if (wsi->http.content_length_given) {
+			if (wsi->http.rx_content_length > hit->max_http_body_size) {
+				lwsl_warn("%s: mount rejected Content-Length %llu > max %llu\n",
+					__func__, (unsigned long long)wsi->http.rx_content_length,
+					(unsigned long long)hit->max_http_body_size);
+				lws_return_http_status(wsi, HTTP_STATUS_REQ_ENTITY_TOO_LARGE, NULL);
+				return 1;
+			}
+		} else {
+			/* Unbounded stream, use max_http_body_size as a countdown limit */
+			wsi->http.rx_content_length = hit->max_http_body_size;
+			wsi->http.rx_content_remain = hit->max_http_body_size;
+		}
+	}
 
 #if defined(LWS_WITH_FILE_OPS)
 	s = uri_ptr + hit->mountpoint_len;

@@ -267,6 +267,14 @@ handle_first:
 
 		wsi->ws->this_frame_masked = !!(c & 0x80);
 
+#if defined(LWS_WITH_SERVER)
+		if (lwsi_role_server(wsi) && !wsi->ws->this_frame_masked) {
+			lws_close_reason(wsi, LWS_CLOSE_STATUS_PROTOCOL_ERR,
+					 (uint8_t *)"client unmasked", 15);
+			goto ret_asking_close;
+		}
+#endif
+
 		switch (c & 0x7f) {
 		case 126:
 			/* control frames are not allowed to have big lengths */

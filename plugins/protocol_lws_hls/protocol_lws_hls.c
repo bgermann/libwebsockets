@@ -16,6 +16,57 @@
 
 #include "private-lws-hls.h"
 #include <string.h>
+#include <unistd.h>
+#include <libgen.h>
+
+static const char * const stub_req_paths[] = { "delete" };
+
+static signed char
+stub_req_cb(struct lejp_ctx *ctx, char reason)
+{
+	struct per_session_data__lws_hls *pss = (struct per_session_data__lws_hls *)ctx->user;
+	struct per_vhost_data__lws_hls *vhd = (struct per_vhost_data__lws_hls *)
+			lws_protocol_vh_priv_get(lws_get_vhost(pss->wsi),
+					lws_get_protocol(pss->wsi));
+
+	if (reason == LEJPCB_VAL_STR_END && ctx->path_match - 1 == 0) {
+		char filename[256];
+		lws_strncpy(filename, ctx->buf, sizeof(filename));
+		lws_filename_purify_inplace(filename);
+		
+		char path[512];
+		lws_snprintf(path, sizeof(path), "%s/%s", vhd->media_dir, filename);
+		
+		lwsl_notice("Stub deleting: %s\n", path);
+		unlink(path);
+		
+		/* if there was a container subdir, and it is now empty, remove it */
+		char *dir_path = dirname(path);
+		if (dir_path && strncmp(dir_path, vhd->media_dir, strlen(vhd->media_dir)) == 0 && strcmp(dir_path, vhd->media_dir) != 0) {
+			rmdir(dir_path); /* rmdir only succeeds if directory is empty */
+		}
+	}
+
+	return 0;
+}
+
+static int
+callback_lws_hls(struct lws *wsi, enum lws_callback_reasons reason,
+		 void *user, void *in, size_t len);
+
+#define LWS_PLUGIN_PROTOCOL_LWS_HLS \
+	{ \
+		"lws-hls", \
+		callback_lws_hls, \
+		sizeof(struct per_session_data__lws_hls), \
+		1024, \
+		0, NULL, 0 \
+	}
+
+static const struct lws_protocols stub_prots[] = {
+	LWS_PLUGIN_PROTOCOL_LWS_HLS,
+	LWS_PROTOCOL_LIST_TERM
+};
 
 static int
 callback_lws_hls(struct lws *wsi, enum lws_callback_reasons reason,
@@ -46,6 +97,54 @@ callback_lws_hls(struct lws *wsi, enum lws_callback_reasons reason,
 			lwsl_err("%s: media-dir pvo required\n", __func__);
 			return 1;
 		}
+
+		if ((pvo = lws_pvo_search((const struct lws_protocol_vhost_options *)in, "jwt-jwk"))) {
+			if (pvo->value[0] == '{' || lws_jwk_load(&vhd->jwk, pvo->value, NULL, NULL)) {
+				if (lws_jwk_import(&vhd->jwk, NULL, NULL, pvo->value, strlen(pvo->value))) {
+					lwsl_err("%s: failed to load/import JWK\n", __func__);
+					return 1;
+				}
+			}
+			vhd->has_jwk = 1;
+		}
+
+#if defined(LWS_WITH_STUB)
+		if (lws_cmdline_option_cx(lws_get_context(wsi), "--lws-stub")) {
+			struct lws_stub_config sc;
+			char secret[129];
+			char extra[512];
+			memset(&sc, 0, sizeof(sc));
+			memset(extra, 0, sizeof(extra));
+			sc.cx = lws_get_context(wsi);
+			sc.vh = lws_get_vhost(wsi);
+			sc.stub_name = "lws-hls-stub";
+			sc.uds_path = "/tmp/lws-hls-stub.sock";
+			sc.protocols = stub_prots;
+			
+			if (lws_stub_server_init(&sc, secret, extra, sizeof(extra)) < 0)
+				return 1;
+				
+			/* Update our media_dir to the one provided by the parent via extra_payload */
+			if (extra[0])
+				vhd->media_dir = strdup(extra);
+				
+			return 0;
+		}
+
+		{
+			struct lws_stub_config sc;
+			memset(&sc, 0, sizeof(sc));
+			sc.cx = lws_get_context(wsi);
+			sc.vh = lws_get_vhost(wsi);
+			sc.stub_name = "lws-hls-stub";
+			sc.uds_path = "/tmp/lws-hls-stub.sock";
+			sc.protocols = stub_prots;
+			sc.parent_protocol_name = "lws-hls";
+			sc.extra_payload = vhd->media_dir;
+			sc.extra_payload_len = strlen(vhd->media_dir) + 1;
+			vhd->stub_mgr = lws_stub_spawn(&sc);
+		}
+#endif
 
 		vhd->context = lws_get_context(wsi);
 		vhd->protocol = lws_get_protocol(wsi);
@@ -97,6 +196,20 @@ callback_lws_hls(struct lws *wsi, enum lws_callback_reasons reason,
 			free(idx);
 			idx = next;
 		}
+
+#if defined(LWS_WITH_STUB)
+		if (vhd->stub_mgr)
+			lws_stub_destroy(&vhd->stub_mgr);
+#endif
+		if (vhd->has_jwk)
+			lws_jwk_destroy(&vhd->jwk);
+		break;
+
+	case LWS_CALLBACK_HTTP_BIND_PROTOCOL:
+		if (vhd && pss) {
+			pss->wsi = wsi;
+			lws_ll_fwd_insert(pss, pss_list, vhd->pss_list);
+		}
 		break;
 
 	case LWS_CALLBACK_HTTP:
@@ -105,6 +218,17 @@ callback_lws_hls(struct lws *wsi, enum lws_callback_reasons reason,
 
 		if (!vhd)
 			return lws_callback_http_dummy(wsi, reason, user, in, len);
+
+		pss->has_star_grant = 0;
+		if (vhd->has_jwk) {
+			struct lws_jwt_auth *ja = lws_jwt_auth_create(wsi, &vhd->jwk, "auth_session", NULL, wsi, NULL);
+			if (ja) {
+				if (lws_jwt_auth_query_grant(ja, "*") >= 1 || lws_jwt_auth_query_grant(ja, "hls:2") >= 1) {
+					pss->has_star_grant = 1;
+				}
+				lws_jwt_auth_destroy(&ja);
+			}
+		}
 
 		lwsl_info("HLS plugin received HTTP request for '%s'\n", url ? url : "NULL");
 		
@@ -134,13 +258,22 @@ callback_lws_hls(struct lws *wsi, enum lws_callback_reasons reason,
 			return lws_hls_serve_dir(wsi, vhd->media_dir);
 		}
 		else if (!strncmp(url, "/preview/", 9)) {
-			return lws_hls_serve_thumbnail(wsi, vhd->media_dir, url + 9);
+			char filename[256];
+			lws_strncpy(filename, url + 9, sizeof(filename));
+			lws_filename_purify_inplace(filename);
+			return lws_hls_serve_thumbnail(wsi, vhd->media_dir, filename);
 		}
 		else if (!strncmp(url, "/stream/", 8)) {
-			return lws_hls_serve_manifest(wsi, vhd->media_dir, url + 8);
+			char filename[256];
+			lws_strncpy(filename, url + 8, sizeof(filename));
+			lws_filename_purify_inplace(filename);
+			return lws_hls_serve_manifest(wsi, vhd->media_dir, filename);
 		}
 		else if (!strncmp(url, "/init/", 6)) {
-			return lws_hls_serve_init(wsi, vhd->media_dir, url + 6);
+			char filename[256];
+			lws_strncpy(filename, url + 6, sizeof(filename));
+			lws_filename_purify_inplace(filename);
+			return lws_hls_serve_init(wsi, vhd->media_dir, filename);
 		}
 		else if (!strncmp(url, "/segment/", 9)) {
 			const char *p = url + 9;
@@ -155,9 +288,27 @@ callback_lws_hls(struct lws *wsi, enum lws_callback_reasons reason,
 			
 			strncpy(filename, p, fn_len);
 			filename[fn_len] = '\0';
+			lws_filename_purify_inplace(filename);
 			
 			int segment_idx = atoi(sep + 1);
 			return lws_hls_serve_segment(wsi, vhd->media_dir, filename, segment_idx);
+		} else if (!strncmp(url, "/delete/", 8)) {
+			if (!pss->has_star_grant) {
+				lws_return_http_status(wsi, HTTP_STATUS_FORBIDDEN, "Forbidden");
+				return -1;
+			}
+			char filename[256];
+			lws_strncpy(filename, url + 8, sizeof(filename));
+			lws_filename_purify_inplace(filename);
+#if defined(LWS_WITH_STUB)
+			if (vhd->stub_mgr) {
+				char json[256];
+				lws_snprintf(json, sizeof(json), "{\"delete\":\"%s\"}", filename);
+				lws_stub_request(vhd->stub_mgr, json, NULL, 0, NULL, NULL, NULL);
+			}
+#endif
+			lws_return_http_status(wsi, HTTP_STATUS_OK, "OK");
+			return -1;
 		} else {
 			/* Let LWS standard file serving handle static files from the mount origin */
 			return lws_callback_http_dummy(wsi, reason, user, in, len);
@@ -171,13 +322,15 @@ err_404:
 	}
 
 	case LWS_CALLBACK_EVENT_WAIT_CANCELLED:
+
 		if (!vhd)
 			break;
 		/* Thread finished a thumbnail. Wake up all waiting HTTP sessions */
 		lws_start_foreach_llp(struct per_session_data__lws_hls **,
 				      ppss, vhd->pss_list) {
-			if ((*ppss)->waiting_for_thumbnail)
+			if ((*ppss)->waiting_for_thumbnail) {
 				lws_callback_on_writable((*ppss)->wsi);
+			}
 		} lws_end_foreach_llp(ppss, pss_list);
 		break;
 
@@ -194,38 +347,44 @@ err_404:
 			if (c) {
 				/* Found it in cache! */
 				size_t len = c->len;
-				uint8_t *buf = malloc(LWS_PRE + len);
-				if (!buf) {
-					pthread_mutex_unlock(&vhd->lock);
-					return -1;
-				}
-				
+				uint8_t buf[LWS_PRE + 2048];
 				uint8_t *start = buf + LWS_PRE;
 				uint8_t *p = start;
-				uint8_t *end = p + len;
-				
+				uint8_t *end = buf + sizeof(buf) - 1;
+
 				if (lws_add_http_common_headers(wsi, HTTP_STATUS_OK, "image/jpeg",
 								(lws_filepos_t)len, &p, end)) {
-					free(buf);
 					pthread_mutex_unlock(&vhd->lock);
 					return 1;
 				}
 				
 				if (lws_finalize_write_http_header(wsi, start, &p, end)) {
-					free(buf);
 					pthread_mutex_unlock(&vhd->lock);
 					return 1;
 				}
 				
-				memcpy(buf + LWS_PRE, c->data, len);
-				lws_write(wsi, buf + LWS_PRE, len, LWS_WRITE_HTTP_FINAL);
-				free(buf);
+				size_t hl = lws_ptr_diff_size_t(p, start);
+				if (lws_write(wsi, start, hl, LWS_WRITE_HTTP_HEADERS) != (int)hl) {
+					pthread_mutex_unlock(&vhd->lock);
+					return 1;
+				}
+				
+				pss->segment_buf = malloc(LWS_PRE + len);
+				if (!pss->segment_buf) {
+					pthread_mutex_unlock(&vhd->lock);
+					return -1;
+				}
+				
+				memcpy(pss->segment_buf + LWS_PRE, c->data, len);
+				pss->segment_len = len;
+				pss->segment_pos = 0;
+				
+
 				
 				pss->waiting_for_thumbnail = 0;
 				pthread_mutex_unlock(&vhd->lock);
 				
-				if (lws_http_transaction_completed(wsi))
-					return -1;
+				lws_callback_on_writable(wsi);
 				return 0;
 			}
 			
@@ -262,8 +421,7 @@ err_404:
 			chunk = 4096;
 		}
 
-		int flags = (pss->segment_pos + chunk == pss->segment_len) ? LWS_WRITE_HTTP_FINAL : LWS_WRITE_HTTP;
-		
+		int flags = (pss->segment_pos + chunk == pss->segment_len) ? LWS_WRITE_HTTP_FINAL : LWS_WRITE_HTTP;	
 		int m = lws_write(wsi, pss->segment_buf + LWS_PRE + pss->segment_pos, chunk, (enum lws_write_protocol)flags);
 		if (m < 0) {
 			free(pss->segment_buf);
@@ -282,6 +440,7 @@ err_404:
 		pss->segment_buf = NULL;
 		return lws_http_transaction_completed(wsi);
 
+	case LWS_CALLBACK_HTTP_DROP_PROTOCOL:
 	case LWS_CALLBACK_CLOSED_HTTP:
 		if (pss) {
 			if (vhd)
@@ -294,21 +453,33 @@ err_404:
 		}
 		break;
 
+	case LWS_CALLBACK_RAW_RX:
+		if (!pss)
+			break;
+		if (!pss->parser_valid) {
+			lejp_construct(&pss->jctx, stub_req_cb, pss, stub_req_paths, 1);
+			pss->wsi = wsi;
+			pss->parser_valid = 1;
+		}
+		if (lejp_parse(&pss->jctx, (uint8_t *)in, (int)len) < 0) {
+			lwsl_err("Stub lejp parse failed\n");
+			return -1;
+		}
+		break;
+
+	case LWS_CALLBACK_RAW_CLOSE:
+		if (pss && pss->parser_valid) {
+			lejp_destruct(&pss->jctx);
+			pss->parser_valid = 0;
+		}
+		break;
+
 	default:
 		break;
 	}
 
 	return 0;
 }
-
-#define LWS_PLUGIN_PROTOCOL_LWS_HLS \
-	{ \
-		"lws-hls", \
-		callback_lws_hls, \
-		sizeof(struct per_session_data__lws_hls), \
-		1024, \
-		0, NULL, 0 \
-	}
 
 #if !defined (LWS_PLUGIN_STATIC)
 

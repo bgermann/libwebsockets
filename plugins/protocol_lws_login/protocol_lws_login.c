@@ -954,10 +954,10 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 				const char *h = NULL;
 
 				if (vhd->cookie_domain[0])
-					lws_snprintf(cookie, sizeof(cookie), "%s=%s; Path=/; Domain=%s; Max-Age=%llu; HttpOnly; SameSite=None; Secure",
+					lws_snprintf(cookie, sizeof(cookie), "%s=%s; Path=/; Domain=%s; Max-Age=%llu; HttpOnly; SameSite=Lax; Secure",
 							 vhd->cookie_name, pss->silent_update_jwt, vhd->cookie_domain, (unsigned long long)vhd->jwt_validity_secs);
 				else
-					lws_snprintf(cookie, sizeof(cookie), "%s=%s; Path=/; Max-Age=%llu; HttpOnly; SameSite=None; Secure",
+					lws_snprintf(cookie, sizeof(cookie), "%s=%s; Path=/; Max-Age=%llu; HttpOnly; SameSite=Lax; Secure",
 							 vhd->cookie_name, pss->silent_update_jwt, (unsigned long long)vhd->jwt_validity_secs);
 
 				path[0] = '\0';
@@ -1212,11 +1212,11 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 				lws_strncpy(redirect_uri, "/", sizeof(redirect_uri));
 
 			if (vhd->cookie_domain[0])
-				lws_snprintf(cookie_hdr1, sizeof(cookie_hdr1), "%s=; Path=/; Domain=%s; Expires=%s; Max-Age=0; HttpOnly; SameSite=None; Secure", vhd->cookie_name, vhd->cookie_domain, exp);
+				lws_snprintf(cookie_hdr1, sizeof(cookie_hdr1), "%s=; Path=/; Domain=%s; Expires=%s; Max-Age=0; HttpOnly; SameSite=Lax; Secure", vhd->cookie_name, vhd->cookie_domain, exp);
 			else
-				lws_snprintf(cookie_hdr1, sizeof(cookie_hdr1), "%s=; Path=/; Expires=%s; Max-Age=0; HttpOnly; SameSite=None; Secure", vhd->cookie_name, exp);
+				lws_snprintf(cookie_hdr1, sizeof(cookie_hdr1), "%s=; Path=/; Expires=%s; Max-Age=0; HttpOnly; SameSite=Lax; Secure", vhd->cookie_name, exp);
 
-			lws_snprintf(cookie_hdr1_host, sizeof(cookie_hdr1_host), "%s=; Path=/; Expires=%s; Max-Age=0; HttpOnly; SameSite=None; Secure", vhd->cookie_name, exp);
+			lws_snprintf(cookie_hdr1_host, sizeof(cookie_hdr1_host), "%s=; Path=/; Expires=%s; Max-Age=0; HttpOnly; SameSite=Lax; Secure", vhd->cookie_name, exp);
 
 			char urlenc_path[512];
 			lws_urlencode(urlenc_path, redirect_uri, sizeof(urlenc_path));
@@ -1307,10 +1307,8 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 				char origin[128];
 				if (token && vhd && vhd->auth_server_url && lws_hdr_copy(wsi, origin, sizeof(origin), WSI_TOKEN_ORIGIN) > 0) {
 					size_t olen = strlen(origin);
-					if (olen == 4 && !strcmp(origin, "null")) {
-						lwsl_notice("%s: allowing null origin due to redirect bounce\n", __func__);
-					} else if (strncmp(origin, vhd->auth_server_url, olen) ||
-						   (vhd->auth_server_url[olen] != '\0' && vhd->auth_server_url[olen] != '/')) {
+					if (strncmp(origin, vhd->auth_server_url, olen) ||
+					    (vhd->auth_server_url[olen] != '\0' && vhd->auth_server_url[olen] != '/')) {
 						lwsl_err("%s: blocking SSO CSRF from origin %s\n", __func__, origin);
 						token = NULL; /* Nullify to force failure */
 					}
@@ -1343,10 +1341,10 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 				if (pss->silent_update_jwt && final_target) {
 					char cookie[LWS_SSO_MAX_COOKIE];
 					if (vhd->cookie_domain[0]) {
-						lws_snprintf(cookie, sizeof(cookie), "%s=%s; Path=/; Domain=%s; Max-Age=%llu; HttpOnly; SameSite=None; Secure",
+						lws_snprintf(cookie, sizeof(cookie), "%s=%s; Path=/; Domain=%s; Max-Age=%llu; HttpOnly; SameSite=Lax; Secure",
 							     vhd->cookie_name, pss->silent_update_jwt, vhd->cookie_domain, (unsigned long long)vhd->jwt_validity_secs);
 					} else {
-						lws_snprintf(cookie, sizeof(cookie), "%s=%s; Path=/; Max-Age=%llu; HttpOnly; SameSite=None; Secure",
+						lws_snprintf(cookie, sizeof(cookie), "%s=%s; Path=/; Max-Age=%llu; HttpOnly; SameSite=Lax; Secure",
 							     vhd->cookie_name, pss->silent_update_jwt, (unsigned long long)vhd->jwt_validity_secs);
 					}
 
@@ -1394,10 +1392,10 @@ callback_lws_login(struct lws *wsi, enum lws_callback_reasons reason,
 				int n;
 
 				if (vhd->cookie_domain[0]) {
-					n = lws_snprintf(cookie, sizeof(cookie), "%s=%s; Path=/; Domain=%s; Max-Age=%llu; HttpOnly; SameSite=None; Secure",
+					n = lws_snprintf(cookie, sizeof(cookie), "%s=%s; Path=/; Domain=%s; Max-Age=%llu; HttpOnly; SameSite=Lax; Secure",
 							 vhd->cookie_name, ps->token, vhd->cookie_domain, (unsigned long long)vhd->jwt_validity_secs);
 				} else {
-					n = lws_snprintf(cookie, sizeof(cookie), "%s=%s; Path=/; Max-Age=%llu; HttpOnly; SameSite=None; Secure",
+					n = lws_snprintf(cookie, sizeof(cookie), "%s=%s; Path=/; Max-Age=%llu; HttpOnly; SameSite=Lax; Secure",
 							 vhd->cookie_name, ps->token, (unsigned long long)vhd->jwt_validity_secs);
 				}
 

@@ -41,9 +41,19 @@
 
 #include <libwebsockets/lws-rtp.h>
 #include <libwebsockets/lws-srtp.h>
+
 #include <libwebsockets/lws-stun.h>
 
 #include "protocol_lws_webrtc.h"
+
+#if defined(LWS_WITH_MBEDTLS)
+#include <mbedtls/ssl.h>
+#include <mbedtls/x509_crt.h>
+#include <mbedtls/md.h>
+#elif !defined(LWS_WITH_GNUTLS) && !defined(LWS_WITH_SCHANNEL) && !defined(LWS_WITH_OPENHITLS)
+#include <openssl/ssl.h>
+#include <openssl/x509.h>
+#endif
 #include <stdarg.h>
 
 static void
@@ -854,6 +864,23 @@ handle_candidate(struct pss_webrtc *pss, struct vhd_webrtc *vhd, const char *can
 
 		if (lws_sa46_parse_numeric_address(ip_str, &pss->media->peer_sa46) < 0)
 			return -1;
+
+		if (pss->media->peer_sa46.sa4.sin_family == AF_INET) {
+			uint32_t a4 = ntohl(pss->media->peer_sa46.sa4.sin_addr.s_addr);
+			if (a4 == 0 || (a4 >> 24) == 127 || (a4 >> 28) >= 14) {
+				webrtc_pss_log(pss, "Rejecting invalid ICE candidate IP %s\n", ip_str);
+				return 0;
+			}
+		} else {
+			const uint8_t *a6 = pss->media->peer_sa46.sa6.sin6_addr.s6_addr;
+			static const uint8_t in6addr_any[16] = {0};
+			static const uint8_t in6addr_loopback[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1};
+			
+			if (!memcmp(a6, in6addr_any, 16) || !memcmp(a6, in6addr_loopback, 16) || a6[0] == 0xff) {
+				webrtc_pss_log(pss, "Rejecting invalid ICE candidate IPv6 %s\n", ip_str);
+				return 0;
+			}
+		}
 		sa46_sockport(&pss->media->peer_sa46, htons((uint16_t)port));
 		pss->media->has_peer_sa46 = 1;
 
@@ -2111,6 +2138,46 @@ webrtc_handle_dtls(struct lws *wsi, struct pss_webrtc *pss, const struct sockadd
 		}
 
 		if (!pss->media->handshake_done && lws_gendtls_handshake_done(&pss->dtls_ctx)) {
+			/* F-108: Verify peer fingerprint */
+			int verified = 0;
+#if defined(LWS_WITH_MBEDTLS)
+			const mbedtls_x509_crt *cert = mbedtls_ssl_get_peer_cert(&pss->dtls_ctx.ssl);
+			if (cert) {
+				unsigned char md[32];
+				if (mbedtls_md(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), cert->raw.p, cert->raw.len, md) == 0) {
+					char computed[128];
+					for (unsigned int i = 0; i < 32; i++) {
+						lws_snprintf(computed + (i * 3), 4, "%02X%c", md[i], i == 31 ? '\0' : ':');
+					}
+					if (!lws_timingsafe_bcmp(computed, pss->fingerprint_remote, strlen(pss->fingerprint_remote)))
+						verified = 1;
+				}
+			}
+#elif !defined(LWS_WITH_GNUTLS) && !defined(LWS_WITH_SCHANNEL) && !defined(LWS_WITH_OPENHITLS)
+			/* Assume OpenSSL */
+			X509 *cert = SSL_get_peer_certificate((SSL *)pss->dtls_ctx.ssl);
+			if (cert) {
+				unsigned char md[EVP_MAX_MD_SIZE];
+				unsigned int md_len = 0;
+				if (X509_digest(cert, EVP_sha256(), md, &md_len) && md_len == 32) {
+					char computed[128];
+					for (unsigned int i = 0; i < md_len; i++) {
+						lws_snprintf(computed + (i * 3), 4, "%02X%c", md[i], i == 31 ? '\0' : ':');
+					}
+					if (!lws_timingsafe_bcmp(computed, pss->fingerprint_remote, strlen(pss->fingerprint_remote)))
+						verified = 1;
+				}
+				X509_free(cert);
+			}
+#else
+			/* Fallback if unsupported crypto, accept for now */
+			verified = 1;
+#endif
+			if (!verified) {
+				lwsl_err("%s: DTLS Fingerprint mismatch! Rejecting connection.\n", __func__);
+				return -1;
+			}
+
 			pss->media->handshake_done = 1;
 			webrtc_pss_log(pss, "DTLS Handshake DONE! Cipher: %s\n", lws_gendtls_get_srtp_profile(&pss->dtls_ctx));
 

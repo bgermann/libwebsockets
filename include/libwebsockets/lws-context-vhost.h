@@ -1122,6 +1122,9 @@ struct lws_context_creation_info {
 	uint32_t			quic_0rtt_max_size;
 	/**< CONTEXT: 0 for default (4096), or the desired max 0-RTT early data size */
 
+	uint64_t			max_http_body_size;
+	/**< VHOST: 0 for default (100MB), or the desired max HTTP body size */
+
 #if !defined(__STRICT_ANSI__)
 	void *_unused[1]; /**< dummy */
 #endif
@@ -1572,6 +1575,9 @@ struct lws_http_mount {
 	 * if the protocol on that mount says we are not authorized.
 	 */
 #endif
+
+	uint64_t max_http_body_size;
+	/**< 0 for default (100MB), or the desired max HTTP body size */
 
 	/* Add new things just above here ---^
 	 * This is part of the ABI, don't needlessly break compatibility

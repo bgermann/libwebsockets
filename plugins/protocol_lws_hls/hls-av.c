@@ -63,6 +63,9 @@ lws_hls_thumbnail_worker(void *d)
                                                         frame = av_frame_alloc();
                                                         pkt = av_packet_alloc();
                                                         
+                                                        int64_t target_ts = av_rescale_q(10 * AV_TIME_BASE, AV_TIME_BASE_Q, fmt_ctx->streams[video_idx]->time_base);
+                                                        av_seek_frame(fmt_ctx, video_idx, target_ts, AVSEEK_FLAG_BACKWARD);
+                                                        
                                                         while (av_read_frame(fmt_ctx, pkt) >= 0) {
                                                                 if (pkt->stream_index == video_idx) {
                                                                         if (avcodec_send_packet(dec_ctx, pkt) == 0) {

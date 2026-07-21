@@ -689,6 +689,8 @@ _lws_mqtt_rx_parser(struct lws *wsi, lws_mqtt_parser_t *par,
 				/* reset consumption counter */
 				par->consumed = 0;
 				par->props_len = par->vbit.value;
+				if (par->props_len > par->cpkt_remlen)
+					goto send_protocol_error_and_close;
 				lws_mqtt_vbi_init(&par->vbit);
 				par->state = LMQCPP_PROP_ID_VBI;
 				break;
@@ -732,6 +734,9 @@ _lws_mqtt_rx_parser(struct lws *wsi, lws_mqtt_parser_t *par,
 			par->cpkt_remlen -= 2;
 			par->n = 0;
 
+			if (par->cpkt_remlen)
+				goto send_protocol_error_and_close;
+
 			goto cmd_completion;
 
 		/* PUBREL */
@@ -768,6 +773,9 @@ _lws_mqtt_rx_parser(struct lws *wsi, lws_mqtt_parser_t *par,
 			par->cpkt_remlen -= 2;
 			par->n = 0;
 
+			if (par->cpkt_remlen)
+				goto send_protocol_error_and_close;
+
 			goto cmd_completion;
 
 		/* PUBCOMP */
@@ -803,6 +811,9 @@ _lws_mqtt_rx_parser(struct lws *wsi, lws_mqtt_parser_t *par,
 			len -= 2;
 			par->cpkt_remlen -= 2;
 			par->n = 0;
+
+			if (par->cpkt_remlen)
+				goto send_protocol_error_and_close;
 
 			goto cmd_completion;
 
@@ -1139,8 +1150,12 @@ _lws_mqtt_rx_parser(struct lws *wsi, lws_mqtt_parser_t *par,
 
 		case LMQCPP_SUBACK_PAYLOAD:
 		{
-			lws_mqtt_qos_levels_t qos = (lws_mqtt_qos_levels_t)*buf++;
+			lws_mqtt_qos_levels_t qos;
 
+			if (!len)
+				return 0;
+
+			qos = (lws_mqtt_qos_levels_t)*buf++;
 			len--;
 			switch (qos) {
 				case QOS0:
@@ -1204,6 +1219,9 @@ _lws_mqtt_rx_parser(struct lws *wsi, lws_mqtt_parser_t *par,
 			par->cpkt_remlen -= 2;
 			par->n = 0;
 
+			if (par->cpkt_remlen)
+				goto send_protocol_error_and_close;
+
 			goto cmd_completion;
 
 		case LMQCPP_PUBACK_PACKET:
@@ -1239,11 +1257,9 @@ _lws_mqtt_rx_parser(struct lws *wsi, lws_mqtt_parser_t *par,
 			 * There are 3 fixed bytes and then a VBI for the
 			 * property section length
 			 */
+			if (!len)
+				return 0;
 			par->fixed_seen[par->fixed++] = *buf++;
-			if (len < par->cpkt_remlen - par->n) {
-				lwsl_notice("%s: len breakage 4\n", __func__);
-				return -1;
-			}
 			len--;
 			par->n++;
 			if (par->fixed == 2)
@@ -1265,6 +1281,8 @@ _lws_mqtt_rx_parser(struct lws *wsi, lws_mqtt_parser_t *par,
 				break;
 			case LMSPR_COMPLETED:
 				par->props_len = par->vbit.value;
+				if (par->props_len > par->cpkt_remlen - par->n)
+					goto send_protocol_error_and_close;
 				lwsl_info("%s: PUBACK props len = %d\n",
 					  __func__, (int)par->cpkt_remlen);
 				/*
@@ -1290,6 +1308,8 @@ _lws_mqtt_rx_parser(struct lws *wsi, lws_mqtt_parser_t *par,
 			/*
 			 * TODO: stash the props
 			 */
+			if (!len)
+				return 0;
 			par->props_consumed++;
 			len--;
 			buf++;

@@ -106,9 +106,15 @@ lws_extension_callback_pm_deflate(struct lws_context *context,
 		oa = in;
 		lwsl_wsi_ext(wsi, "option set: idx %d, %s, len %d",
 			 oa->option_index, oa->start, oa->len);
-		if (oa->start)
-			priv->args[oa->option_index] = (unsigned char)atoi(oa->start);
-		else
+		if (oa->start) {
+			int v = atoi(oa->start);
+			if (oa->option_index == PMD_SERVER_MAX_WINDOW_BITS ||
+			    oa->option_index == PMD_CLIENT_MAX_WINDOW_BITS) {
+				if (v < 8 || v > 15)
+					return -1;
+			}
+			priv->args[oa->option_index] = (unsigned char)v;
+		} else
 			priv->args[oa->option_index] = 1;
 
 		if (priv->args[PMD_CLIENT_MAX_WINDOW_BITS] == 8)
